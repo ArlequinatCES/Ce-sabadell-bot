@@ -3,11 +3,16 @@
 Bot de novetats i resultats del CE Sabadell per a X (Twitter).
 
 Flux:
-  1. Recull articles recents de fonts fiables (Google News + web oficial del club).
-  2. Filtra els que ja s'han publicat abans (fitxer posted.json).
-  3. Formata un tuit per a cada novetat nova (títol al post principal, enllaç en resposta).
+  1. Recull articles PUBLICATS AVUI de fonts fiables (Marca, As, Sport, Mundo
+     Deportivo, Google News general, i la web oficial del club).
+  2. Descarta els que no siguin d'avui i els que ja s'han publicat abans
+     (fitxer posted.json).
+  3. Formata un tuit per a cada novetat nova (títol al post, enllaç en fil).
   4. Publica via l'API de Postproxy (que ja té el compte de X connectat).
   5. Desa l'estat perquè no es repeteixin publicacions en la propera execució.
+
+Pensat per executar-se cada hora (veure .github/workflows/bot.yml): a cada
+execució només publica novetats que encara no s'havien vist.
 
 Variables d'entorn necessàries:
   POSTPROXY_API_KEY   -> clau de l'API de Postproxy (Settings > API Keys al dashboard)
@@ -26,17 +31,62 @@ import hashlib
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 
 import requests
+
+# Fus horari de referència per decidir què compta com "d'avui".
+LOCAL_TZ = ZoneInfo("Europe/Madrid")
 
 # ─────────────────────────────────────────────────────────────────────────
 # CONFIG — edita aquí segons les teves preferències
 # ─────────────────────────────────────────────────────────────────────────
 
 CONFIG = {
+    # Fonts RSS. Es fan servir cerques de Google News acotades a cada mitjà
+    # (site:...) per assegurar cobertura de premsa esportiva de referència,
+    # més una cerca general i la web oficial del club.
     "sources": [
         {
-            "name": "Google News - CE Sabadell",
+            "name": "Marca",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:marca.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "As",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:as.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "Sport",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:sport.es+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "Mundo Deportivo",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:mundodeportivo.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "BeSoccer",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:besoccer.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "El Desmarque",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:eldesmarque.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "Cadena SER",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+%22futbol%22+site:cadenaser.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "Cadena COPE",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+%22futbol%22+site:cope.es+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "LaLiga Hypermotion (oficial)",
+            "url": "https://news.google.com/rss/search?q=%22Sabadell%22+site:laliga.com+when:1d&hl=ca&gl=ES&ceid=ES:ca",
+        },
+        {
+            "name": "Google News - CE Sabadell (general)",
             "url": "https://news.google.com/rss/search?q=%22CE%20Sabadell%22%20OR%20%22Centre%20d%27Esports%20Sabadell%22%20when:1d&hl=ca&gl=ES&ceid=ES:ca",
         },
         {
@@ -44,9 +94,19 @@ CONFIG = {
             "url": "https://www.cesabadellfc.com/es/feed/",
         },
     ],
-    "max_posts_per_run": 3,
+    # Nombre màxim de tuits nous que es publiquen en una sola execució.
+    # Com que ara corre cada hora, n'hi ha prou amb un marge petit.
+    "max_posts_per_run": 5,
+    # Si és True, només es publiquen articles amb pubDate d'avui (hora local
+    # Europe/Madrid). Els articles sense data reconeguda es descarten per
+    # seguretat quan aquesta opció està activada.
+    "only_today": True,
+    # Fitxer on es guarden els enllaços ja publicats, per no repetir-los.
     "state_file": "posted.json",
+    # Quants dies de "memòria" es conserven al fitxer d'estat (neteja automàtica).
     "state_retention_days": 30,
+    # Perfil de destí a Postproxy. Pot ser "twitter" (agafa el primer perfil
+    # de X connectat) o l'id concret del perfil si en tens més d'un.
     # Nota: fem servir "or" i no el segon argument de os.environ.get(), perquè
     # GitHub Actions passa la variable com a cadena buida si no s'ha definit
     # (no com a variable absent), i el segon argument de .get() només actua
@@ -66,11 +126,13 @@ def log(msg: str) -> None:
 
 
 def clean_html(raw: str) -> str:
+    """Treu etiquetes HTML i descodifica entitats d'un fragment de text."""
     text = re.sub(r"<[^>]+>", "", raw or "")
     return html.unescape(text).strip()
 
 
 def fetch_rss(url: str, name: str):
+    """Descarrega i parseja un feed RSS. Retorna una llista d'items normalitzats."""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (CE-Sabadell-Bot)"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -103,13 +165,60 @@ def fetch_rss(url: str, name: str):
     return items
 
 
+def is_from_today(item: dict) -> bool:
+    """Comprova si el pubDate de l'article correspon al dia d'avui, en hora
+    local (Europe/Madrid). Si no es pot interpretar la data, es descarta
+    l'article (millor perdre'n un que publicar-ne un de vell per error)."""
+    raw = item.get("pub_date", "")
+    if not raw:
+        return False
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local_dt = dt.astimezone(LOCAL_TZ)
+    today_local = datetime.now(LOCAL_TZ).date()
+    return local_dt.date() == today_local
+
+
 def looks_relevant(item: dict) -> bool:
+    """Filtre de rellevància en dos nivells, per evitar notícies locals de
+    Sabadell (ciutat) que no tenen res a veure amb el club de futbol:
+
+      1. Si el text conté un identificador inequívoc del club (p. ex.
+         "CE Sabadell", "Arlequinat", "Centre d'Esports", "Nova Creu Alta"),
+         es considera rellevant directament.
+      2. Si només conté "Sabadell" a soles, cal que aparegui també
+         vocabulari futbolístic/de Lliga Hypermotion — així es descarten
+         notícies de successos, ajuntament, cultura, etc. de la ciutat.
+    """
     text = f"{item['title']} {item['summary']}".lower()
-    keywords = ["sabadell", "arlequinat", "nova creu alta", "centre d'esports"]
-    return any(k in text for k in keywords)
+
+    club_identifiers = [
+        "ce sabadell", "c.e. sabadell", "arlequinat", "nova creu alta",
+        "centre d'esports", "centre d'esports sabadell",
+    ]
+    if any(k in text for k in club_identifiers):
+        return True
+
+    if "sabadell" not in text:
+        return False
+
+    football_context = [
+        "liga hypermotion", "lliga hypermotion", "segunda división",
+        "segunda divisió", "futbol", "fútbol", "partido", "partit",
+        "gol", "gols", "goles", "golejada", "jornada", "entrenador",
+        "fitxatge", "fitxatges", "fichaje", "fichajes", "pretemporada",
+        "davanter", "porteria", "porter", "lliga", "liga", "clasificación",
+        "classificació", "estadi", "estadio",
+    ]
+    return any(k in text for k in football_context)
 
 
 def item_id(item: dict) -> str:
+    """Identificador estable per detectar duplicats (hash de l'enllaç)."""
     return hashlib.sha256(item["link"].encode("utf-8")).hexdigest()
 
 
@@ -134,8 +243,11 @@ def prune_state(state: dict, retention_days: int) -> dict:
 
 
 def build_tweet(item: dict):
-    """X no permet enllaços al cos del primer post via Postproxy; cal
-    publicar-lo com una resposta en fil. Retorna (text_principal, enllaç)."""
+    """Construeix el text del tuit principal i el de la resposta amb l'enllaç.
+
+    X no permet enllaços al cos del primer post via Postproxy; cal publicar-lo
+    com una resposta en fil (thread). Retorna (text_principal, text_enllaç).
+    """
     title = item["title"].strip()
     link = item["link"].strip()
     max_title_len = 280
@@ -189,15 +301,19 @@ def main() -> int:
         log(f"Font '{source['name']}': {len(items)} articles trobats.")
         all_items.extend(items)
 
+    # Filtra rellevància + duplicats ja publicats
     new_items = []
     for item in all_items:
         if not looks_relevant(item):
+            continue
+        if CONFIG["only_today"] and not is_from_today(item):
             continue
         iid = item_id(item)
         if iid in state:
             continue
         new_items.append((iid, item))
 
+    # Evita duplicats dins la mateixa execució (mateixa notícia a dues fonts)
     seen_titles = set()
     dedup_items = []
     for iid, item in new_items:
@@ -227,7 +343,7 @@ def main() -> int:
                 "posted_at": time.time(),
             }
             published_count += 1
-            time.sleep(3)
+            time.sleep(3)  # marge petit entre publicacions
         else:
             log(f"No s'ha pogut publicar: {item['title']}")
 
