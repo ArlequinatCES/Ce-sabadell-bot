@@ -1,0 +1,45 @@
+name: CE Sabadell X Bot
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+    - cron: "0 11 * * *"
+    - cron: "0 16 * * *"
+    - cron: "0 20 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositori
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instal·lar dependències
+        run: pip install -r requirements.txt
+
+      - name: Executar el bot
+        env:
+          POSTPROXY_API_KEY: ${{ secrets.POSTPROXY_API_KEY }}
+          POSTPROXY_PROFILE: ${{ vars.POSTPROXY_PROFILE }}
+        run: python bot.py
+
+      - name: Desar l'estat de publicacions (posted.json)
+        run: |
+          git config user.name "ce-sabadell-bot"
+          git config user.email "actions@github.com"
+          if ! git diff --quiet -- posted.json; then
+            git add posted.json
+            git commit -m "Actualitza estat de publicacions [skip ci]"
+            git push
+          else
+            echo "Sense canvis a posted.json"
+          fi
