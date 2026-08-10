@@ -55,7 +55,7 @@ CONFIG = {
     "state_retention_days": 30,
     # Perfil de destí a Postproxy. Pot ser "twitter" (agafa el primer perfil
     # de X connectat) o l'id concret del perfil si en tens més d'un.
-    "postproxy_profile": os.environ.get("POSTPROXY_PROFILE", "twitter"),
+    "postproxy_profile": os.environ.get("POSTPROXY_PROFILE" or "twitter"),
 }
 
 POSTPROXY_API_URL = "https://api.postproxy.dev/api/posts"
